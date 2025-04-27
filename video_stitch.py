@@ -7,9 +7,15 @@ class VideoPanoramaStitcher:
     def __init__(self, frame_step=5, downscale=0.5):
         self.frame_step = frame_step
         self.downscale  = downscale
+
         #ORB for keypoints/descriptors 
-        self.detector  = cv2.ORB_create(5000)
-        self.matcher   = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        self.detector_orb  = cv2.ORB_create(20000)
+        # for keypoints/descriptor
+        self.detector_sift  = cv2.SIFT_create(20000)
+
+        self.matcher_sift   = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+        self.matcher_orb    = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+
 
     def sample_frames(self, path):
         cap = cv2.VideoCapture(path)
@@ -27,12 +33,20 @@ class VideoPanoramaStitcher:
         cap.release()
         return frames
 
-    def detect_and_describe(self, img):
+    def detect_and_describe_orb(self, img):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        return self.detector.detectAndCompute(gray, None)
+        return self.detector_orb.detectAndCompute(gray, None)
 
-    def match_keypoints(self, A, B, ratio=0.75):
-        raw = self.matcher.knnMatch(A, B, k=2)
+    def detect_and_describe_sift(self, img):
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        return self.detector_sift.detectAndCompute(gray, None)
+
+    def match_keypoints_orb(self, A, B, ratio=0.75):
+        raw = self.matcher_orb.knnMatch(A, B, k=2)
+        return [m for m,n in raw if m.distance < ratio*n.distance]
+
+    def match_keypoints_sift(self, A, B, ratio=0.75):
+        raw = self.matcher_sift.knnMatch(A, B, k=2)
         return [m for m,n in raw if m.distance < ratio*n.distance]
 
     def estimate_homography(self, kpA, kpB, matches):
@@ -53,15 +67,38 @@ class VideoPanoramaStitcher:
 
         # 2) init pano
         pano = frames[0].copy()
-        kp_p, des_p = self.detect_and_describe(pano)
+        kp_p_orb, des_p_orb = self.detect_and_describe_orb(pano)
+        kp_p_sift, des_p_sift = self.detect_and_describe_sift(pano)
 
         # 3) iterate
         for img in tqdm(frames[1:], desc="Stitching"):
-            kp_i, des_i = self.detect_and_describe(img)
-            if des_i is None or des_p is None:
+            kp_i_orb, des_i_orb = self.detect_and_describe_orb(img)
+            kp_i_sift, des_i_sift = self.detect_and_describe_sift(img)
+            
+            # match ORB
+            if des_i_orb is None or des_p_orb is None:
+                matches_orb = []
+            else:
+                matches_orb = self.match_keypoints_orb(des_i_orb, des_p_orb)
+            
+            # match SIFT
+            if des_i_sift is None or des_p_sift is None:
+                matches_sift = []
+            else:
+                matches_sift = self.match_keypoints_sift(des_i_sift, des_p_sift)
+            
+            # Combine keypoints from ORB and SIFT
+            kp_i_combined = kp_i_orb + kp_i_sift
+            kp_p_combined = kp_p_orb + kp_p_sift
+
+            # Combine matches from ORB and SIFT
+            matches_combined = matches_orb + matches_sift
+            if len(matches_combined) < 4:
+                print("Not enough matches found.")
                 continue
-            matches = self.match_keypoints(des_i, des_p)
-            H = self.estimate_homography(kp_i, kp_p, matches)
+
+            # Estimate homography using the combined keypoints and matches
+            H = self.estimate_homography(kp_i_combined, kp_p_combined, matches_combined)
             if H is None:
                 continue
 
@@ -109,7 +146,8 @@ class VideoPanoramaStitcher:
             pano = (pano_w.astype(np.float32)*wp + img_w.astype(np.float32)*wi).astype(np.uint8)
 
             # update features
-            kp_p, des_p = self.detect_and_describe(pano)
+            kp_p_orb, des_p_orb = self.detect_and_describe_orb(pano)
+            kp_p_sift, des_p_sift = self.detect_and_describe_sift(pano)
 
         # 4) final crop
         gray = cv2.cvtColor(pano, cv2.COLOR_BGR2GRAY)
